@@ -1,0 +1,1 @@
+/home/pflug/mc100/mc100-rev_2.4-openwrt/build_dir/target-arm_cortex-a9+neon_musl_eabi/linux-imx6/linux-4.14.195/tools/spi-target-arm_cortex-a9+neon_musl_eabi/../../include/uapi/linux/spi/spidev.h
