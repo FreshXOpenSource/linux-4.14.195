@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  *  Driver core for serial ports
  *
@@ -5,20 +6,6 @@
  *
  *  Copyright 1999 ARM Limited
  *  Copyright (C) 2000-2001 Deep Blue Solutions Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 #include <linux/module.h>
 #include <linux/tty.h>
@@ -195,7 +182,6 @@ static int uart_port_startup(struct tty_struct *tty, struct uart_state *state,
 {
 	struct uart_port *uport = uart_port_check(state);
 	unsigned long page;
-	unsigned long flags = 0;
 	int retval = 0;
 
 	if (uport->type == PORT_UNKNOWN)
@@ -210,22 +196,14 @@ static int uart_port_startup(struct tty_struct *tty, struct uart_state *state,
 	 * Initialise and allocate the transmit and temporary
 	 * buffer.
 	 */
-	page = get_zeroed_page(GFP_KERNEL);
-	if (!page)
-		return -ENOMEM;
-
-	uart_port_lock(state, flags);
 	if (!state->xmit.buf) {
+		/* This is protected by the per port mutex */
+		page = get_zeroed_page(GFP_KERNEL);
+		if (!page)
+			return -ENOMEM;
+
 		state->xmit.buf = (unsigned char *) page;
 		uart_circ_clear(&state->xmit);
-		uart_port_unlock(uport, flags);
-	} else {
-		uart_port_unlock(uport, flags);
-		/*
-		 * Do not free() the page under the port lock, see
-		 * uart_shutdown().
-		 */
-		free_page(page);
 	}
 
 	retval = uport->ops->startup(uport);
@@ -285,8 +263,6 @@ static void uart_shutdown(struct tty_struct *tty, struct uart_state *state)
 {
 	struct uart_port *uport = uart_port_check(state);
 	struct tty_port *port = &state->port;
-	unsigned long flags = 0;
-	char *xmit_buf = NULL;
 
 	/*
 	 * Set the TTY IO error marker
@@ -317,18 +293,12 @@ static void uart_shutdown(struct tty_struct *tty, struct uart_state *state)
 	tty_port_set_suspended(port, 0);
 
 	/*
-	 * Do not free() the transmit buffer page under the port lock since
-	 * this can create various circular locking scenarios. For instance,
-	 * console driver may need to allocate/free a debug object, which
-	 * can endup in printk() recursion.
+	 * Free the transmit buffer page.
 	 */
-	uart_port_lock(state, flags);
-	xmit_buf = state->xmit.buf;
-	state->xmit.buf = NULL;
-	uart_port_unlock(uport, flags);
-
-	if (xmit_buf)
-		free_page((unsigned long)xmit_buf);
+	if (state->xmit.buf) {
+		free_page((unsigned long)state->xmit.buf);
+		state->xmit.buf = NULL;
+	}
 }
 
 /**
@@ -563,12 +533,10 @@ static int uart_put_char(struct tty_struct *tty, unsigned char c)
 	int ret = 0;
 
 	circ = &state->xmit;
-	port = uart_port_lock(state, flags);
-	if (!circ->buf) {
-		uart_port_unlock(port, flags);
+	if (!circ->buf)
 		return 0;
-	}
 
+	port = uart_port_lock(state, flags);
 	if (port && uart_circ_chars_free(circ) != 0) {
 		circ->buf[circ->head] = c;
 		circ->head = (circ->head + 1) & (UART_XMIT_SIZE - 1);
@@ -601,13 +569,11 @@ static int uart_write(struct tty_struct *tty,
 		return -EL3HLT;
 	}
 
-	port = uart_port_lock(state, flags);
 	circ = &state->xmit;
-	if (!circ->buf) {
-		uart_port_unlock(port, flags);
+	if (!circ->buf)
 		return 0;
-	}
 
+	port = uart_port_lock(state, flags);
 	while (port) {
 		c = CIRC_SPACE_TO_END(circ->head, circ->tail, UART_XMIT_SIZE);
 		if (count < c)
@@ -1125,7 +1091,7 @@ static int uart_break_ctl(struct tty_struct *tty, int break_state)
 	if (!uport)
 		goto out;
 
-	if (uport->type != PORT_UNKNOWN && uport->ops->break_ctl)
+	if (uport->type != PORT_UNKNOWN)
 		uport->ops->break_ctl(uport, break_state);
 	ret = 0;
 out:
@@ -1507,10 +1473,10 @@ out:
 static void uart_close(struct tty_struct *tty, struct file *filp)
 {
 	struct uart_state *state = tty->driver_data;
-	struct tty_port *port;
 
 	if (!state) {
 		struct uart_driver *drv = tty->driver->driver_state;
+		struct tty_port *port;
 
 		state = drv->state + tty->index;
 		port = &state->port;
@@ -1520,7 +1486,6 @@ static void uart_close(struct tty_struct *tty, struct file *filp)
 		return;
 	}
 
-	port = &state->port;
 	pr_debug("uart_close(%d) called\n", tty->index);
 
 	tty_port_close(tty->port, tty, filp);
@@ -1728,8 +1693,11 @@ static void uart_dtr_rts(struct tty_port *port, int raise)
  */
 static int uart_open(struct tty_struct *tty, struct file *filp)
 {
-	struct uart_state *state = tty->driver_data;
-	int retval;
+	struct uart_driver *drv = tty->driver->driver_state;
+	int retval, line = tty->index;
+	struct uart_state *state = drv->state + line;
+
+	tty->driver_data = state;
 
 	retval = tty_port_open(&state->port, tty, filp);
 	if (retval > 0)
@@ -1996,9 +1964,10 @@ EXPORT_SYMBOL_GPL(uart_parse_earlycon);
  *	eg: 115200n8r
  */
 void
-uart_parse_options(char *options, int *baud, int *parity, int *bits, int *flow)
+uart_parse_options(const char *options, int *baud, int *parity,
+		   int *bits, int *flow)
 {
-	char *s = options;
+	const char *s = options;
 
 	*baud = simple_strtoul(s, NULL, 10);
 	while (*s >= '0' && *s <= '9')
@@ -2428,18 +2397,7 @@ static void uart_poll_put_char(struct tty_driver *driver, int line, char ch)
 }
 #endif
 
-static int uart_install(struct tty_driver *driver, struct tty_struct *tty)
-{
-	struct uart_driver *drv = driver->driver_state;
-	struct uart_state *state = drv->state + tty->index;
-
-	tty->driver_data = state;
-
-	return tty_standard_install(driver, tty);
-}
-
 static const struct tty_operations uart_ops = {
-	.install	= uart_install,
 	.open		= uart_open,
 	.close		= uart_close,
 	.write		= uart_write,
@@ -3063,6 +3021,50 @@ EXPORT_SYMBOL(uart_suspend_port);
 EXPORT_SYMBOL(uart_resume_port);
 EXPORT_SYMBOL(uart_add_one_port);
 EXPORT_SYMBOL(uart_remove_one_port);
+
+/**
+ * uart_get_rs485_mode() - retrieve rs485 properties for given uart
+ * @dev: uart device
+ * @rs485conf: output parameter
+ *
+ * This function implements the device tree binding described in
+ * Documentation/devicetree/bindings/serial/rs485.txt.
+ */
+void uart_get_rs485_mode(struct device *dev, struct serial_rs485 *rs485conf)
+{
+	u32 rs485_delay[2];
+	int ret;
+
+	ret = device_property_read_u32_array(dev, "rs485-rts-delay",
+					     rs485_delay, 2);
+	if (!ret) {
+		rs485conf->delay_rts_before_send = rs485_delay[0];
+		rs485conf->delay_rts_after_send = rs485_delay[1];
+	} else {
+		rs485conf->delay_rts_before_send = 0;
+		rs485conf->delay_rts_after_send = 0;
+	}
+
+	/*
+	 * Clear full-duplex and enabled flags, set RTS polarity to active high
+	 * to get to a defined state with the following properties:
+	 */
+	rs485conf->flags &= ~(SER_RS485_RX_DURING_TX | SER_RS485_ENABLED |
+			      SER_RS485_RTS_AFTER_SEND);
+	rs485conf->flags |= SER_RS485_RTS_ON_SEND;
+
+	if (device_property_read_bool(dev, "rs485-rx-during-tx"))
+		rs485conf->flags |= SER_RS485_RX_DURING_TX;
+
+	if (device_property_read_bool(dev, "linux,rs485-enabled-at-boot-time"))
+		rs485conf->flags |= SER_RS485_ENABLED;
+
+	if (device_property_read_bool(dev, "rs485-rts-active-low")) {
+		rs485conf->flags &= ~SER_RS485_RTS_ON_SEND;
+		rs485conf->flags |= SER_RS485_RTS_AFTER_SEND;
+	}
+}
+EXPORT_SYMBOL_GPL(uart_get_rs485_mode);
 
 MODULE_DESCRIPTION("Serial driver core");
 MODULE_LICENSE("GPL");

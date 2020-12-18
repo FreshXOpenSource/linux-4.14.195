@@ -427,6 +427,10 @@ static int ds1307_get_time(struct device *dev, struct rtc_time *t)
 	    IS_ENABLED(CONFIG_RTC_DRV_DS1307_CENTURY))
 		t->tm_year += 100;
 
+	if (t->tm_year < 120) {
+		// HW clock has a time before 2020, so not valid!
+		return -EINVAL;
+	}
 	dev_dbg(dev, "%s secs=%d, mins=%d, "
 		"hours=%d, mday=%d, mon=%d, year=%d, wday=%d\n",
 		"read", t->tm_sec, t->tm_min,
